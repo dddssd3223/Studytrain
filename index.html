@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -361,6 +362,13 @@ h1 em{font-style:normal;color:var(--amber)}
 .ai-loading .mini-train{animation:miniRun 1.2s ease-in-out infinite}
 @keyframes miniRun{0%,100%{transform:translateX(0)}50%{transform:translateX(8px)}}
 
+.ai-apply-row{
+  display:none;align-items:center;gap:14px;margin-top:14px;flex-wrap:wrap;
+}
+.ai-apply-row.show{display:flex}
+#applyPlanMsg{font-size:13px;color:var(--green);display:none}
+#applyPlanMsg.show{display:inline}
+
 /* ── 알림 팝업 (쉬는 시간) ─────────────────────────── */
 .toast-container{
   position:fixed;top:18px;left:50%;transform:translateX(-50%);
@@ -659,6 +667,10 @@ h1 em{font-style:normal;color:var(--amber)}
       </div>
       <div class="ai-loading" id="aiLoading"><span class="mini-train">🚄</span> 기관사가 운행 일지를 검토하는 중…</div>
       <div class="ai-output" id="aiOutput"></div>
+      <div class="ai-apply-row" id="aiApplyRow">
+        <button class="btn btn-amber" id="applyPlanBtn">이대로 다음 날 계획에 적용하기</button>
+        <span id="applyPlanMsg"></span>
+      </div>
     </div>
 
   </section>
@@ -779,12 +791,24 @@ h1 em{font-style:normal;color:var(--amber)}
   </div>
 </div>
 
+<!-- 계획 덮어쓰기 경고 -->
+<div class="modal-overlay" id="overwriteModal">
+  <div class="modal-box" style="max-width:400px">
+    <h3>⚠️ 계획을 덮어쓸까요?</h3>
+    <p class="mdesc" id="overwriteMsg">그 요일에는 이미 입력해 둔 계획이 있어요. AI 제안으로 덮어쓰면 기존 내용은 사라집니다.</p>
+    <div class="modal-actions">
+      <button class="btn btn-amber" id="overwriteConfirmBtn">덮어쓰기</button>
+      <button class="btn btn-ghost" id="overwriteCancelBtn">취소</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 
 /* ★★★ 배포 전에 딱 한 번, 본인 것으로 수정하세요 ★★★
    .config.json 파일이 들어있는 GitHub 저장소 (예: 'wjb-study/study-express') */
-const CONFIG_REPO = 'dddssd3223/Studytrain';
+const CONFIG_REPO = 'YOUR_GITHUB_ID/YOUR_REPO';
 
 /* ─────────── 시간표 데이터 ─────────── */
 const DAYS = ['월','화','수','목','금'];
@@ -1544,6 +1568,88 @@ function tableToHtml(rows){
   return h;
 }
 
+let pendingPlanApply = null;   // {day, entries} — AI가 제안한 다음날 계획 (적용 대기중)
+
+function parsePlanSuggestion(raw){
+  const entries = {};
+  raw.split('\n').forEach(line=>{
+    const m = line.match(/^\s*\**\s*(\d{1,2})\s*교시\s*(?:\([^)]*\))?\s*[→\-:]\s*(.+?)\**\s*$/);
+    if(m){
+      const n = +m[1];
+      const text = m[2].trim();
+      if(n >= 1 && n <= 7 && text) entries[n] = text;
+    }
+  });
+  return entries;
+}
+
+function hideApplyRow(){
+  pendingPlanApply = null;
+  $('aiApplyRow').classList.remove('show');
+  $('applyPlanMsg').classList.remove('show');
+}
+
+async function runAI(prompt, btn, kind){
+  const out = $('aiOutput'), load = $('aiLoading');
+  out.className = 'ai-output'; out.textContent = '';
+  hideApplyRow();
+  load.classList.add('show');
+  btn.disabled = true;
+  try{
+    const reply = await callAI(prompt);
+    out.innerHTML = renderMarkdown(reply);
+    out.className = 'ai-output show';
+
+    if(kind === 'plan'){
+      const tIdx = DAYS.indexOf(todayKey);
+      const nextKey = DAYS[(tIdx + 1) % 5];
+      const entries = parsePlanSuggestion(reply);
+      if(Object.keys(entries).length){
+        pendingPlanApply = {day: nextKey, entries};
+        $('aiApplyRow').classList.add('show');
+      }
+    }
+  }catch(err){
+    out.textContent = '피드백을 받지 못했습니다: ' + err.message + '\n[AI 피드백 설정] 탭에서 엔진과 키를 확인해 주세요.';
+    out.className = 'ai-output show err';
+  }finally{
+    load.classList.remove('show');
+    btn.disabled = false;
+  }
+}
+
+/* 제안 적용 — 기존 계획이 있으면 덮어쓰기 경고 먼저 */
+function tryApplyPlanSuggestion(){
+  if(!pendingPlanApply) return;
+  const {day, entries} = pendingPlanApply;
+  const hasExisting = Object.keys(entries).some(nStr => (plans[day][+nStr - 1] || '').trim() !== '');
+  if(hasExisting){
+    $('overwriteMsg').textContent = `${day}요일에는 이미 입력해 둔 계획이 있어요. AI 제안으로 덮어쓰면 기존 내용은 사라집니다.`;
+    $('overwriteModal').classList.add('show');
+  } else {
+    applyPlanSuggestion();
+  }
+}
+function applyPlanSuggestion(){
+  if(!pendingPlanApply) return;
+  const {day, entries} = pendingPlanApply;
+  Object.keys(entries).forEach(nStr=>{
+    const n = +nStr;
+    if(TT[day][n-1]) plans[day][n-1] = entries[nStr];
+  });
+  if(planDay === day) renderPlanRows();
+  renderStations();
+  saveToGist();
+  $('overwriteModal').classList.remove('show');
+  const msg = $('applyPlanMsg');
+  msg.textContent = `✓ ${day}요일 계획에 반영했어요`;
+  msg.classList.add('show');
+  setTimeout(()=>msg.classList.remove('show'), 4000);
+}
+$('applyPlanBtn').addEventListener('click', tryApplyPlanSuggestion);
+$('overwriteConfirmBtn').addEventListener('click', applyPlanSuggestion);
+$('overwriteCancelBtn').addEventListener('click', ()=>$('overwriteModal').classList.remove('show'));
+
 /* ─────────── AI 피드백 프롬프트 & 버튼 ─────────── */
 function buildRunLog(){
   const tt = TT[todayKey];
@@ -1556,23 +1662,6 @@ function buildRunLog(){
     log += `${p.n}교시 (${p.s}~${p.e}) | 학교수업: ${sc.sub} | 내 계획: ${plan} | 결과: ${res==='done'?'완성':res==='fail'?'실패':'미기록'}\n`;
   });
   return log;
-}
-async function runAI(prompt, btn){
-  const out = $('aiOutput'), load = $('aiLoading');
-  out.className = 'ai-output'; out.textContent = '';
-  load.classList.add('show');
-  btn.disabled = true;
-  try{
-    const reply = await callAI(prompt);
-    out.innerHTML = renderMarkdown(reply);
-    out.className = 'ai-output show';
-  }catch(err){
-    out.textContent = '피드백을 받지 못했습니다: ' + err.message + '\n[AI 피드백 설정] 탭에서 엔진과 키를 확인해 주세요.';
-    out.className = 'ai-output show err';
-  }finally{
-    load.classList.remove('show');
-    btn.disabled = false;
-  }
 }
 $('aiFeedbackBtn').addEventListener('click', function(){
   const prompt =
@@ -1587,7 +1676,7 @@ ${buildRunLog()}
 3. 개선할 점 1~2개 (실패했거나 계획이 비어 있는 교시 중심으로, 구체적으로)
 4. 내일을 위한 조언 한 줄
 전체 350자 이내, 불릿 없이 자연스러운 문단으로.`;
-  runAI(prompt, this);
+  runAI(prompt, this, 'feedback');
 });
 $('aiPlanBtn').addEventListener('click', function(){
   const tIdx = DAYS.indexOf(todayKey);
@@ -1607,8 +1696,10 @@ ${buildRunLog()}
 [다음 운행일(${nextKey}) 학교 시간표]
 ${sched}
 
-오늘의 결과를 반영해서, ${nextKey}요일 각 교시에 어떤 수능 공부를 배치하면 좋을지 교시별로 짧게 제안해줘. 한국어로, 각 교시당 한 줄씩. 실패한 과목의 보완과 과목 균형을 고려할 것. 마지막에 한 줄 격려.`;
-  runAI(prompt, this);
+오늘의 결과를 반영해서, ${nextKey}요일 각 교시에 어떤 수능 공부를 배치하면 좋을지 교시별로 짧게 제안해줘. 한국어로, 수업이 없는 교시는 건너뛰고, 각 교시당 반드시 한 줄씩 아래 형식만 사용해서 작성해:
+N교시 (과목) → 제안 내용
+형식에서 벗어나는 줄(제목, 소개, 표 등)을 절대 섞지 말고, 교시 목록을 다 쓴 다음 마지막 줄에만 한 줄 격려를 추가해. 실패한 과목의 보완과 과목 균형을 고려할 것.`;
+  runAI(prompt, this, 'plan');
 });
 
 /* Gist의 'aiconfig.json' 파일에 비밀번호로 암호화해서 저장 */
